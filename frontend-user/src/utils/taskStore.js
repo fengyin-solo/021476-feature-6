@@ -103,7 +103,7 @@ const statusConfig = {
   pending_shipment: { text: '待发货', type: 'warning' },
   shipped: { text: '已发货', type: 'info' },
   completed: { text: '已完成', type: 'success' },
-  cancelled: { text: '已取消', type: 'success' }
+  cancelled: { text: '已取消', type: 'danger' }
 }
 
 function loadTasks() {
@@ -127,16 +127,28 @@ function saveTasks(tasks) {
 }
 
 function getDefaultTasks() {
+  // 预置一个 3 天后的待付款预约，用于演示占用状态与记录的联动
+  const demoDate = new Date(Date.now() + 3 * 86400000)
+  const demoDateStr = formatDate(demoDate).split(' ')[0]
   return [
     {
       id: 'T' + Date.now().toString() + '001',
       type: 'booking',
       title: '3号球桌 - 美式九球',
-      subtitle: '2026-02-15 14:00 - 16:00',
+      subtitle: `${demoDateStr} 14:00 - 16:00`,
       amount: 120,
       status: 'pending_payment',
       createdAt: formatDate(new Date(Date.now() - 86400000)),
-      extra: { tableId: 3, date: '2026-02-15', time: '14:00 - 16:00' }
+      extra: {
+        tableId: 3,
+        tableName: '3号球桌',
+        date: demoDateStr,
+        time: '14:00 - 16:00',
+        startHour: 14,
+        endHour: 16,
+        duration: 2,
+        orderNo: 'BK20260001'
+      }
     },
     {
       id: 'T' + Date.now().toString() + '002',
@@ -210,7 +222,7 @@ export const taskStore = {
       return tasks.filter(t => t.status !== 'completed' && t.status !== 'cancelled')
     }
     if (status === 'completed') {
-      return tasks.filter(t => t.status === 'completed')
+      return tasks.filter(t => t.status === 'completed' || t.status === 'cancelled')
     }
     return tasks
   },
@@ -229,7 +241,11 @@ export const taskStore = {
       ...taskData
     }
     tasks.unshift(newTask)
-    saveTasks(tasks)
+    // 保存失败时不能让业务以为记录已创建，返回 null 以保证状态与记录一致
+    if (!saveTasks(tasks)) {
+      logger.error('任务保存失败，已回滚', newTask)
+      return null
+    }
     logger.info('任务已添加', newTask)
     return enrichTask(newTask)
   },
@@ -241,10 +257,19 @@ export const taskStore = {
       logger.warn('任务不存在', taskId)
       return null
     }
-    tasks[index] = { ...tasks[index], ...updates }
-    saveTasks(tasks)
+    const nextTask = {
+      ...tasks[index],
+      ...updates,
+      // extra 深一层合并，避免更新单个字段时丢失其余记录信息
+      extra: { ...(tasks[index].extra || {}), ...(updates.extra || {}) }
+    }
+    tasks[index] = nextTask
+    if (!saveTasks(tasks)) {
+      logger.error('任务更新保存失败，已回滚', taskId)
+      return null
+    }
     logger.info('任务已更新', taskId, updates)
-    return enrichTask(tasks[index])
+    return enrichTask(nextTask)
   },
 
   updateStatus(taskId, newStatus) {
@@ -263,9 +288,34 @@ export const taskStore = {
       logger.warn('任务不存在，无法删除', taskId)
       return false
     }
-    saveTasks(filtered)
+    if (!saveTasks(filtered)) {
+      logger.error('任务删除保存失败，已回滚', taskId)
+      return false
+    }
     logger.info('任务已删除', taskId)
     return true
+  },
+
+  /**
+   * 取消任务（软删除：记录保留，状态置为 cancelled）
+   * 预约类任务取消后，占用判定会自动释放对应时段，
+   * 保证“可用状态”和“预约记录”不会错配。
+   */
+  cancel(taskId, reason) {
+    const task = this.getById(taskId)
+    if (!task) {
+      logger.warn('任务不存在，无法取消', taskId)
+      return null
+    }
+    if (task.status === 'cancelled') {
+      logger.warn('任务已是取消状态', taskId)
+      return task
+    }
+    return this.update(taskId, {
+      status: 'cancelled',
+      subtitle: reason ? `已取消（${reason}）` : '已取消',
+      cancelledAt: formatDate(new Date())
+    })
   },
 
   addBookingTask(table, bookingInfo) {
@@ -277,8 +327,11 @@ export const taskStore = {
       status: 'pending_payment',
       extra: {
         tableId: table.id,
+        tableName: table.name,
         date: bookingInfo.date,
         time: bookingInfo.time,
+        startHour: bookingInfo.startHour,
+        endHour: bookingInfo.endHour,
         duration: bookingInfo.duration,
         orderNo: bookingInfo.orderNo
       }
@@ -335,10 +388,15 @@ export const taskStore = {
   markAsPaid(taskId) {
     const task = this.getById(taskId)
     if (!task) return null
-    
+    // 已取消的记录不允许支付，避免记录与可用状态错配
+    if (task.status === 'cancelled') {
+      logger.warn('任务已取消，无法支付', taskId)
+      return null
+    }
+
     let newStatus = 'upcoming'
     let newSubtitle = '支付成功'
-    
+
     if (task.type === 'order') {
       newStatus = 'pending_shipment'
       newSubtitle = '支付成功，待发货'
@@ -347,7 +405,7 @@ export const taskStore = {
     } else if (task.type === 'booking') {
       newSubtitle = '支付成功，等待使用'
     }
-    
+
     return this.update(taskId, { status: newStatus, subtitle: newSubtitle })
   },
 

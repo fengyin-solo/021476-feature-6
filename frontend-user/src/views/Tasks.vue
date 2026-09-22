@@ -243,6 +243,7 @@ import Toast from '../components/Toast.vue'
 import { logger } from '../utils/api'
 import { authState } from '../utils/auth'
 import { taskStore } from '../utils/taskStore'
+import { notifyBookingsChanged } from '../utils/booking'
 
 export default {
   name: 'Tasks',
@@ -280,7 +281,8 @@ export default {
       return this.allTasks.filter(task => task.status !== 'completed' && task.status !== 'cancelled')
     },
     completedTasks() {
-      return this.allTasks.filter(task => task.status === 'completed')
+      // 已完成与已取消都属于“已结束”记录，取消的预约记录保留以便追溯
+      return this.allTasks.filter(task => task.status === 'completed' || task.status === 'cancelled')
     },
     pendingCount() {
       return this.pendingTasks.length
@@ -303,6 +305,11 @@ export default {
   },
   mounted() {
     this.refreshTasks()
+    // 预约成功/取消等占用变化后，任务列表保持同步
+    window.addEventListener('billiard:bookings-changed', this.refreshTasks)
+  },
+  beforeUnmount() {
+    window.removeEventListener('billiard:bookings-changed', this.refreshTasks)
   },
   activated() {
     this.refreshTasks()
@@ -398,17 +405,21 @@ export default {
     async confirmCancel() {
       if (!this.selectedTask) return
       this.cancelLoading = true
-      
+
       await new Promise(resolve => setTimeout(resolve, 800))
-      
-      const result = taskStore.remove(this.selectedTask.id)
-      
+
+      // 软取消：记录保留并置为“已取消”；预约类同时释放球桌占用
+      const result = taskStore.cancel(this.selectedTask.id)
+
       this.cancelLoading = false
       this.showCancelModal = false
-      
+
       if (result) {
         this.refreshTasks()
-        this.showNotification('success', '取消成功', '任务已取消')
+        this.showNotification('success', '取消成功', this.selectedTask.type === 'booking' ? '预约已取消，球桌时段已释放' : '任务已取消')
+        if (this.selectedTask.type === 'booking') {
+          notifyBookingsChanged()
+        }
         logger.info('Task cancelled', { taskId: this.selectedTask.id })
       } else {
         this.showNotification('error', '取消失败', '请稍后重试')
@@ -642,6 +653,11 @@ export default {
   opacity: 0.9;
 }
 
+.task-card.danger {
+  border-left: 4px solid #ff6b6b;
+  opacity: 0.9;
+}
+
 .task-header {
   display: flex;
   justify-content: space-between;
@@ -689,6 +705,11 @@ export default {
 .task-status.success {
   background: rgba(108, 117, 125, 0.15);
   color: #6c757d;
+}
+
+.task-status.danger {
+  background: rgba(255, 107, 107, 0.15);
+  color: #ff6b6b;
 }
 
 .task-body {
@@ -888,6 +909,11 @@ export default {
 .detail-status.success {
   background: rgba(108, 117, 125, 0.15);
   color: #6c757d;
+}
+
+.detail-status.danger {
+  background: rgba(255, 107, 107, 0.15);
+  color: #ff6b6b;
 }
 
 .detail-list {

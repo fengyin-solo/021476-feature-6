@@ -52,7 +52,7 @@
             <div v-for="booking in recentBookings" :key="booking.id" class="booking-card" @click="viewBookingDetail(booking)">
               <div class="booking-date"><span class="day">{{ getDay(booking.date) }}</span><span class="month">{{ getMonth(booking.date) }}</span></div>
               <div class="booking-info"><h4>{{ booking.tableName }}</h4><p class="booking-time"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>{{ booking.time }}</p></div>
-              <div class="booking-status" :class="booking.status">{{ statusText[booking.status] }}</div>
+              <div class="booking-status" :class="booking.status">{{ statusText[booking.status] || '待付款' }}</div>
             </div>
           </div>
         </section>
@@ -101,13 +101,13 @@
     </Modal>
 
     <!-- Booking Detail Modal -->
-    <Modal v-model="showBookingDetailModal" title="预约详情" size="small" :show-cancel="false" :confirm-text="selectedBooking?.status === 'upcoming' ? '取消预约' : '关闭'" :confirm-type="selectedBooking?.status === 'upcoming' ? 'danger' : 'primary'" @confirm="handleBookingAction">
+    <Modal v-model="showBookingDetailModal" title="预约详情" size="small" :show-cancel="false" :confirm-text="canCancelBooking(selectedBooking) ? '取消预约' : '关闭'" :confirm-type="canCancelBooking(selectedBooking) ? 'danger' : 'primary'" @confirm="handleBookingAction">
       <div v-if="selectedBooking" class="booking-detail">
         <div class="detail-row"><span class="label">预约编号</span><span class="value">{{ selectedBooking.orderNo }}</span></div>
         <div class="detail-row"><span class="label">球桌</span><span class="value">{{ selectedBooking.tableName }}</span></div>
         <div class="detail-row"><span class="label">日期</span><span class="value">{{ selectedBooking.date }}</span></div>
         <div class="detail-row"><span class="label">时段</span><span class="value">{{ selectedBooking.time }}</span></div>
-        <div class="detail-row"><span class="label">状态</span><span class="value status" :class="selectedBooking.status">{{ statusText[selectedBooking.status] }}</span></div>
+        <div class="detail-row"><span class="label">状态</span><span class="value status" :class="selectedBooking.status">{{ statusText[selectedBooking.status] || '待付款' }}</span></div>
       </div>
     </Modal>
 
@@ -126,6 +126,8 @@ import Modal from '../components/Modal.vue'
 import Toast from '../components/Toast.vue'
 import { authState, logout } from '../utils/auth'
 import { logger } from '../utils/api'
+import { taskStore } from '../utils/taskStore'
+import { notifyBookingsChanged, BOOKINGS_CHANGED_EVENT } from '../utils/booking'
 
 export default {
   name: 'Profile',
@@ -148,12 +150,15 @@ export default {
       toastTitle: '',
       toastMessage: '',
       editForm: { name: '', phone: '', email: '' },
-      statusText: { completed: '已完成', upcoming: '待使用', cancelled: '已取消' },
-      recentBookings: [
-        { id: 1, orderNo: 'BK20260001', tableName: '3号球桌 - 美式九球', date: '2026-02-15', time: '14:00 - 16:00', status: 'upcoming' },
-        { id: 2, orderNo: 'BK20260002', tableName: '1号球桌 - 斯诺克', date: '2026-02-10', time: '19:00 - 21:00', status: 'completed' },
-        { id: 3, orderNo: 'BK20260003', tableName: '5号球桌 - 中式八球', date: '2026-02-08', time: '10:00 - 12:00', status: 'completed' }
-      ],
+      statusText: {
+        pending_payment: '待付款',
+        upcoming: '待使用',
+        ongoing: '进行中',
+        completed: '已完成',
+        cancelled: '已取消'
+      },
+      // 最近预约与任务中心共用同一份预约记录，保证状态不错配
+      recentBookings: [],
       quickActions: [
         { id: 1, name: '任务中心', icon: '📋', action: 'tasks' },
         { id: 2, name: '优惠券', icon: '🎫', action: 'coupon' },
@@ -186,8 +191,30 @@ export default {
       phone: this.user.phone || '',
       email: this.user.email || ''
     }
+    this.loadBookings()
+    // 预约变更（新增/取消）后同步“最近预约”列表
+    window.addEventListener(BOOKINGS_CHANGED_EVENT, this.loadBookings)
+  },
+  beforeUnmount() {
+    window.removeEventListener(BOOKINGS_CHANGED_EVENT, this.loadBookings)
   },
   methods: {
+    /** 从任务中心读取预约记录，作为个人中心唯一的预约数据来源 */
+    loadBookings() {
+      this.recentBookings = taskStore
+        .getAll()
+        .filter(t => t.type === 'booking')
+        .map(t => ({
+          id: t.id,
+          orderNo: t.extra?.orderNo || t.id,
+          tableName: t.title,
+          date: t.extra?.date || '',
+          time: t.extra?.time || '',
+          status: t.status
+        }))
+        .sort((a, b) => (a.date < b.date ? 1 : -1))
+        .slice(0, 5)
+    },
     getDay(date) { return new Date(date).getDate() },
     getMonth(date) { return ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'][new Date(date).getMonth()] },
     handleNavClick(nav) {
@@ -195,13 +222,13 @@ export default {
       if (nav === 'info') {
         this.showEditModal = true
       } else if (nav === 'bookings') {
-        this.showNotification('info', '我的预约', `您有 ${this.recentBookings.filter(b => b.status === 'upcoming').length} 个待使用的预约`)
+        this.showNotification('info', '我的预约', `您有 ${this.recentBookings.filter(b => b.status === 'upcoming' || b.status === 'pending_payment').length} 个待使用的预约`)
       } else if (nav === 'tasks') {
         this.$router.push('/tasks')
       }
     },
     viewAllBookings() {
-      this.showNotification('info', '全部预约', `共 ${this.recentBookings.length} 条预约记录`)
+      this.$router.push('/tasks')
     },
     async saveProfile() {
       // 表单验证
@@ -228,13 +255,31 @@ export default {
       logger.info('Profile updated', { name: this.editForm.name })
     },
     viewBookingDetail(booking) { this.selectedBooking = booking; this.showBookingDetailModal = true },
+    /** 仅待付款 / 待使用的预约允许取消（进行中、已完成、已取消不可取消） */
+    canCancelBooking(booking) {
+      return booking && (booking.status === 'pending_payment' || booking.status === 'upcoming')
+    },
     handleBookingAction() {
-      if (this.selectedBooking?.status === 'upcoming') {
-        this.selectedBooking.status = 'cancelled'
+      const booking = this.selectedBooking
+      if (!booking) {
         this.showBookingDetailModal = false
-        this.showNotification('success', '取消成功', '预约已取消')
-        logger.info('Booking cancelled', { orderNo: this.selectedBooking.orderNo })
-      } else { this.showBookingDetailModal = false }
+        return
+      }
+      if (this.canCancelBooking(booking)) {
+        // 软取消：同步更新任务记录并释放球桌占用，列表状态与记录保持一致
+        const result = taskStore.cancel(booking.id, '用户主动取消')
+        if (result) {
+          this.loadBookings()
+          notifyBookingsChanged()
+          this.showBookingDetailModal = false
+          this.showNotification('success', '取消成功', '预约已取消，球桌时段已释放')
+          logger.info('Booking cancelled', { orderNo: booking.orderNo })
+        } else {
+          this.showNotification('error', '取消失败', '请稍后重试')
+        }
+      } else {
+        this.showBookingDetailModal = false
+      }
     },
     handleAction(action) {
       if (action.action === 'tasks') {
@@ -316,6 +361,8 @@ export default {
 .booking-time svg { width: 14px; height: 14px; }
 .booking-status { padding: 0.4rem 0.8rem; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
 .booking-status.upcoming { background: rgba(0, 217, 165, 0.15); color: var(--primary); }
+.booking-status.pending_payment { background: rgba(255, 193, 7, 0.15); color: #ffc107; }
+.booking-status.ongoing { background: rgba(79, 172, 254, 0.15); color: #4facfe; }
 .booking-status.completed { background: rgba(108, 117, 125, 0.15); color: #6c757d; }
 .booking-status.cancelled { background: rgba(255, 107, 107, 0.15); color: #ff6b6b; }
 .actions-section { background: var(--bg-card); border: 1px solid var(--border); border-radius: 20px; padding: 1.5rem; }
@@ -352,6 +399,8 @@ export default {
 .detail-row .label { color: var(--text-secondary); }
 .detail-row .value { font-weight: 500; }
 .detail-row .value.status.upcoming { color: var(--primary); }
+.detail-row .value.status.pending_payment { color: #ffc107; }
+.detail-row .value.status.ongoing { color: #4facfe; }
 .detail-row .value.status.completed { color: #6c757d; }
 .detail-row .value.status.cancelled { color: #ff6b6b; }
 @media (max-width: 1100px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
