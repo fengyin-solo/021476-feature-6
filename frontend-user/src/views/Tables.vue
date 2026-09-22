@@ -48,7 +48,7 @@
           <div class="table-type-badge">{{ table.type }}</div>
           <div class="status-indicator" :class="table.available ? 'online' : 'offline'">
             <span class="status-dot"></span>
-            <span>{{ table.available ? '可预约' : '已占用' }}</span>
+            <span>{{ table.statusText }}</span>
           </div>
         </div>
         
@@ -82,12 +82,12 @@
               <span class="amount">¥{{ table.price }}</span>
               <span class="unit">/小时</span>
             </div>
-            <button 
-              class="btn-book" 
+            <button
+              class="btn-book"
               :disabled="!table.available"
               @click="openBooking(table)"
             >
-              {{ table.available ? '立即预约' : '暂不可用' }}
+              {{ table.available ? '立即预约' : table.statusText }}
             </button>
           </div>
         </div>
@@ -102,6 +102,10 @@
       size="medium"
       confirm-text="确认预约"
       :loading="bookingLoading"
+      :confirm-disabled="!canConfirm"
+      :show-cancel="!bookingLoading"
+      :show-close="!bookingLoading"
+      :close-on-overlay="!bookingLoading"
       @confirm="confirmBooking"
     >
       <div v-if="selectedTable" class="booking-form">
@@ -117,29 +121,37 @@
         </div>
 
         <div class="form-group">
-          <label>预约日期</label>
+          <label>预约日期（最多可提前 {{ maxAdvanceDaysText }} 天）</label>
           <div class="date-input">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="3" y="4" width="18" height="18" rx="2"/>
               <path d="M16 2v4M8 2v4M3 10h18"/>
             </svg>
-            <input v-model="bookingDate" type="date" :min="today" />
+            <input
+              v-model="bookingDate"
+              type="date"
+              :min="today"
+              :max="maxBookingDate"
+              :disabled="bookingLoading"
+              @change="selectDate(bookingDate)"
+            />
           </div>
         </div>
 
         <div class="form-group">
-          <label>选择时段</label>
+          <label>选择时段（{{ bookingDate }}）</label>
           <div class="time-slots">
-            <button 
-              v-for="slot in timeSlots" 
+            <button
+              v-for="slot in bookingSlots"
               :key="slot.id"
+              type="button"
               class="time-slot"
               :class="{ active: selectedTimeSlot === slot.id, disabled: !slot.available }"
-              :disabled="!slot.available"
-              @click="selectedTimeSlot = slot.id"
+              :disabled="!slot.available || bookingLoading"
+              @click="selectSlot(slot)"
             >
-              <span class="slot-time">{{ slot.time }}</span>
-              <span class="slot-status">{{ slot.available ? '可预约' : '已满' }}</span>
+              <span class="slot-time">{{ slot.label }}</span>
+              <span class="slot-status">{{ slot.statusText }}</span>
             </button>
           </div>
         </div>
@@ -147,16 +159,28 @@
         <div class="form-group">
           <label>预约时长</label>
           <div class="duration-selector">
-            <button 
-              v-for="d in durations" 
-              :key="d"
+            <button
+              v-for="option in durationOptions"
+              :key="option.hours"
+              type="button"
               class="duration-btn"
-              :class="{ active: duration === d }"
-              @click="duration = d"
+              :class="{ active: duration === option.hours, disabled: !option.valid }"
+              :disabled="!option.valid || bookingLoading"
+              :title="option.valid ? '' : option.message"
+              @click="selectDuration(option)"
             >
-              {{ d }}小时
+              {{ option.hours }}小时
             </button>
           </div>
+        </div>
+
+        <div v-if="bookingError" class="booking-error">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="8" x2="12" y2="12"/>
+            <line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+          <span>{{ bookingError }}</span>
         </div>
 
         <div class="booking-summary">
@@ -166,7 +190,7 @@
           </div>
           <div class="summary-row total">
             <span>合计</span>
-            <span class="total-price">¥{{ selectedTable.price * duration }}</span>
+            <span class="total-price">¥{{ totalPrice }}</span>
           </div>
         </div>
       </div>
@@ -204,7 +228,7 @@
     <Toast v-model="showToast" :type="toastType" :title="toastTitle" :message="toastMessage" />
 
     <!-- Login Modal -->
-    <LoginModal v-model="showLoginModal" @login-success="onLoginSuccess" />
+    <LoginModal v-model="showLoginModal" @success="onLoginSuccess" />
   </div>
 </template>
 
@@ -213,63 +237,130 @@ import Modal from '../components/Modal.vue'
 import Toast from '../components/Toast.vue'
 import LoginModal from '../components/LoginModal.vue'
 import { isAuthenticated } from '../utils/auth'
+import { api, logger } from '../utils/api'
 import { taskStore } from '../utils/taskStore'
+import {
+  BASE_TABLES,
+  BASE_TIME_SLOTS,
+  DURATION_OPTIONS,
+  MAX_ADVANCE_DAYS,
+  BOOKING_CHANGED_EVENT,
+  todayStr,
+  maxBookingDateStr,
+  getTableAvailability,
+  getSlotAvailability,
+  getDurationAvailability,
+  getSlotLabel,
+  validateBookingRequest
+} from '../utils/booking'
 
 export default {
   name: 'Tables',
   components: { Modal, Toast, LoginModal },
   data() {
+    const today = todayStr()
     return {
       selectedType: 'all',
-      selectedDate: new Date().toISOString().split('T')[0],
+      selectedDate: today,
       isLoadingTables: false,
+      // 占用数据版本号：预约/取消导致任务变化时自增，驱动可用状态重算
+      occupancyVersion: 0,
       showBookingModal: false,
       showSuccessModal: false,
       bookingLoading: false,
       selectedTable: null,
-      bookingDate: new Date().toISOString().split('T')[0],
-      selectedTimeSlot: 1,
+      bookingDate: today,
+      selectedTimeSlot: null,
       duration: 2,
-      durations: [1, 2, 3, 4],
+      durations: DURATION_OPTIONS,
       bookingResult: null,
       successMessage: '',
+      // 提交前校验/服务端返回的错误提示
+      bookingError: '',
       showToast: false,
       toastType: 'success',
       toastTitle: '',
       toastMessage: '',
       showLoginModal: false,
       pendingTable: null,
+      // 路由续接时等待数据加载的轮询定时器
+      routePollTimer: null,
       tableTypes: [
         { id: 'all', name: '全部', icon: '🎱' },
         { id: 'snooker', name: '斯诺克', icon: '🟢' },
         { id: 'pool', name: '美式九球', icon: '🟡' },
         { id: 'chinese', name: '中式八球', icon: '⚫' }
-      ],
-      timeSlots: [
-        { id: 1, time: '10:00 - 12:00', available: true },
-        { id: 2, time: '12:00 - 14:00', available: true },
-        { id: 3, time: '14:00 - 16:00', available: true },
-        { id: 4, time: '16:00 - 18:00', available: false },
-        { id: 5, time: '18:00 - 20:00', available: true },
-        { id: 6, time: '20:00 - 22:00', available: true }
-      ],
-      tables: [
-        { id: 1, name: '1号球桌', type: '斯诺克', typeId: 'snooker', price: 80, available: true, size: '12尺', brand: '星牌' },
-        { id: 2, name: '2号球桌', type: '斯诺克', typeId: 'snooker', price: 80, available: false, size: '12尺', brand: '星牌' },
-        { id: 3, name: '3号球桌', type: '美式九球', typeId: 'pool', price: 60, available: true, size: '9尺', brand: 'Brunswick' },
-        { id: 4, name: '4号球桌', type: '美式九球', typeId: 'pool', price: 60, available: true, size: '9尺', brand: 'Brunswick' },
-        { id: 5, name: '5号球桌', type: '中式八球', typeId: 'chinese', price: 50, available: false, size: '9尺', brand: '乔氏' },
-        { id: 6, name: '6号球桌', type: '中式八球', typeId: 'chinese', price: 50, available: true, size: '9尺', brand: '乔氏' }
       ]
     }
   },
   computed: {
-    filteredTables() {
-      if (this.selectedType === 'all') return this.tables
-      return this.tables.filter(t => t.typeId === this.selectedType)
-    },
     today() {
-      return new Date().toISOString().split('T')[0]
+      return todayStr()
+    },
+    maxBookingDate() {
+      return maxBookingDateStr()
+    },
+    // 有效预约（归一化时间区间），occupancyVersion 保证任务变化后重新计算
+    activeBookings() {
+      this.occupancyVersion
+      return taskStore.getActiveBookingRanges()
+    },
+    // 结合运营状态、预约记录占用与模拟占用后的球桌列表
+    tablesForDate() {
+      this.occupancyVersion
+      return BASE_TABLES.map(table => {
+        const status = getTableAvailability(table, this.selectedDate, this.activeBookings)
+        return {
+          ...table,
+          available: status.available,
+          unavailableReason: status.reason,
+          statusText: status.reasonText
+        }
+      })
+    },
+    filteredTables() {
+      if (this.selectedType === 'all') return this.tablesForDate
+      return this.tablesForDate.filter(t => t.typeId === this.selectedType)
+    },
+    // 弹窗内展示的时段列表，状态随所选日期/球桌实时计算
+    bookingSlots() {
+      if (!this.selectedTable) {
+        return BASE_TIME_SLOTS.map(slot => ({ ...slot, label: `${slot.start} - ${slot.end}`, available: false, statusText: '不可用' }))
+      }
+      return BASE_TIME_SLOTS.map(slot => {
+        const state = getSlotAvailability(
+          slot.id,
+          this.selectedTable,
+          this.bookingDate,
+          this.activeBookings
+        )
+        return { ...slot, label: `${slot.start} - ${slot.end}`, available: state.available, statusText: state.statusText }
+      })
+    },
+    // 各时长在当前时段下是否可行（超出营业时间/跨占用块时禁用）
+    durationOptions() {
+      return this.durations.map(hours => {
+        let state = { valid: false, message: '' }
+        if (this.selectedTable && this.selectedTimeSlot != null) {
+          state = getDurationAvailability(
+            this.selectedTimeSlot,
+            hours,
+            this.selectedTable,
+            this.bookingDate,
+            this.activeBookings
+          )
+        }
+        return { hours, valid: state.valid, message: state.message }
+      })
+    },
+    totalPrice() {
+      return this.selectedTable ? this.selectedTable.price * this.duration : 0
+    },
+    canConfirm() {
+      return !this.bookingLoading && this.selectedTable != null && this.selectedTimeSlot != null
+    },
+    maxAdvanceDaysText() {
+      return MAX_ADVANCE_DAYS
     }
   },
   watch: {
@@ -277,30 +368,101 @@ export default {
       this.loadTablesForDate()
     }
   },
+  mounted() {
+    this.loadTablesForDate()
+    // 任务中心取消预约后，返回本页也能立即同步球桌占用状态
+    window.addEventListener(BOOKING_CHANGED_EVENT, this.onBookingsChanged)
+    this.handleRouteQuery()
+  },
+  beforeUnmount() {
+    window.removeEventListener(BOOKING_CHANGED_EVENT, this.onBookingsChanged)
+    if (this.routePollTimer) {
+      clearInterval(this.routePollTimer)
+      this.routePollTimer = null
+    }
+  },
   methods: {
+    onBookingsChanged() {
+      this.occupancyVersion++
+    },
     async loadTablesForDate() {
       this.isLoadingTables = true
-      // 模拟API请求延迟
+      const date = this.selectedDate
+      // 模拟按日期加载球桌状态的请求延迟；占用数据本身是确定性的，不会随机跳变
       await new Promise(resolve => setTimeout(resolve, 800))
-      // 模拟不同日期的球桌可用状态变化
-      this.tables = this.tables.map(table => ({
-        ...table,
-        available: Math.random() > 0.3
-      }))
+      // 加载期间用户又切换了日期，则丢弃过期结果（跨日期不错配）
+      if (date !== this.selectedDate) {
+        logger.info('Discard stale table loading result', { requested: date, current: this.selectedDate })
+        return
+      }
+      this.occupancyVersion++
       this.isLoadingTables = false
     },
+    /**
+     * 初始化弹窗表单：根据当前日期的真实占用情况选择默认时段
+     */
+    initBookingForm(table) {
+      this.selectedTable = table
+      this.bookingDate = this.selectedDate
+      this.bookingError = ''
+      this.duration = 2
+
+      const firstFree = BASE_TIME_SLOTS.find(slot => {
+        const state = getSlotAvailability(slot.id, table, this.bookingDate, this.activeBookings)
+        return state.available
+      })
+      this.selectedTimeSlot = firstFree ? firstFree.id : null
+      // 默认时长 2 小时不可行时，退回到第一个可行时长
+      this.$nextTick(() => this.normalizeDuration())
+    },
+    /**
+     * 当当前时长在已选时段下不可行（跨占用块/超营业时间）时，自动选择可行时长
+     */
+    normalizeDuration() {
+      const current = this.durationOptions.find(o => o.hours === this.duration)
+      if (current?.valid) return
+      const fallback = this.durationOptions.find(o => o.valid)
+      this.duration = fallback ? fallback.hours : 2
+    },
     openBooking(table) {
-      // 检查是否已登录
+      // 检查是否已登录，未登录时先记录目标球桌，登录成功后续接预约
       if (!isAuthenticated()) {
         this.pendingTable = table
         this.showLoginModal = true
         return
       }
-      this.selectedTable = table
-      this.bookingDate = this.selectedDate
-      this.selectedTimeSlot = 1
-      this.duration = 2
+      // 二次确认球桌当前仍可约（防止登录弹窗期间状态变化）
+      if (!table.available) {
+        this.showNotification('warning', '该球桌暂不可约', table.statusText || '请选择其他球桌或时段')
+        return
+      }
+      this.initBookingForm(table)
       this.showBookingModal = true
+    },
+    selectDate(date) {
+      if (this.bookingLoading) return
+      this.bookingDate = date
+      this.bookingError = ''
+      // 跨日期修改：重置为新日期下第一个可用时段
+      const firstFree =
+        this.selectedTable &&
+        BASE_TIME_SLOTS.find(slot => {
+          const state = getSlotAvailability(slot.id, this.selectedTable, date, this.activeBookings)
+          return state.available
+        })
+      this.selectedTimeSlot = firstFree ? firstFree.id : null
+      this.$nextTick(() => this.normalizeDuration())
+    },
+    selectSlot(slot) {
+      if (this.bookingLoading || !slot.available) return
+      this.selectedTimeSlot = slot.id
+      this.bookingError = ''
+      this.$nextTick(() => this.normalizeDuration())
+    },
+    selectDuration(option) {
+      if (this.bookingLoading || !option.valid) return
+      this.duration = option.hours
+      this.bookingError = ''
     },
     /**
      * 登录成功回调
@@ -308,40 +470,141 @@ export default {
     onLoginSuccess() {
       this.showLoginModal = false
       if (this.pendingTable) {
-        this.openBooking(this.pendingTable)
+        const table = this.pendingTable
         this.pendingTable = null
+        // 登录前后球桌状态可能已变化，以当前日期的最新判定为准
+        const decorated = this.tablesForDate.find(t => t.id === table.id)
+        if (decorated?.available) {
+          this.initBookingForm(decorated)
+          this.showBookingModal = true
+        } else {
+          this.showNotification('warning', '该球桌暂不可约', decorated?.statusText || '请选择其他球桌')
+        }
       }
     },
+    /**
+     * 确认预约：先完成占用/冲突/时段范围校验，再调用 API；
+     * 仅在 API 成功后写入任务记录，失败时不产生任何记录，状态与记录保持一致。
+     */
     async confirmBooking() {
+      // 防重复提交
+      if (this.bookingLoading) return
+      if (!this.selectedTable) {
+        this.bookingError = '请先选择球桌'
+        return
+      }
+      if (this.selectedTimeSlot == null) {
+        this.bookingError = '请选择预约时段'
+        return
+      }
+
+      // 提交瞬间再次校验，拦截弹窗打开后过期 / 被占用 / 跨日期修改等情况
+      const validation = validateBookingRequest(
+        {
+          table: this.selectedTable,
+          date: this.bookingDate,
+          slotId: this.selectedTimeSlot,
+          duration: this.duration
+        },
+        this.activeBookings
+      )
+      if (!validation.valid) {
+        this.bookingError = validation.error
+        // 失效可能来自新任务写入，刷新占用判定
+        this.onBookingsChanged()
+        return
+      }
+
       this.bookingLoading = true
-      
-      // Simulate API call
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      
-      const slot = this.timeSlots.find(s => s.id === this.selectedTimeSlot)
-      const orderNo = 'BK' + Date.now().toString().slice(-8)
-      this.bookingResult = {
-        orderNo,
-        tableName: this.selectedTable.name,
-        date: this.bookingDate,
-        time: slot.time
+      this.bookingError = ''
+
+      try {
+        const result = await api.bookTable({
+          tableId: this.selectedTable.id,
+          date: this.bookingDate,
+          slotId: this.selectedTimeSlot,
+          duration: this.duration
+        })
+
+        if (!result.success) {
+          // 服务端冲突（重复提交 / 并发抢占）：不写记录，保持弹窗可修改
+          this.bookingError = result.error || '预约失败，请稍后重试'
+          this.onBookingsChanged()
+          logger.warn('Booking rejected by server', { error: result.error })
+          return
+        }
+
+        const slotLabel = getSlotLabel(this.selectedTimeSlot)
+        const orderNo = result.data.orderNo
+        const bookingInfo = {
+          orderNo,
+          date: this.bookingDate,
+          time: slotLabel,
+          duration: this.duration
+        }
+
+        // API 成功后才写入任务中心；写入失败（如存储不可用）视为整体失败
+        const task = taskStore.addBookingTask(this.selectedTable, bookingInfo)
+        if (!task) {
+          this.bookingError = '预约记录保存失败，请稍后重试'
+          return
+        }
+
+        this.bookingResult = {
+          orderNo,
+          tableName: this.selectedTable.name,
+          date: this.bookingDate,
+          time: slotLabel
+        }
+        this.successMessage = `${this.bookingDate} ${slotLabel}`
+
+        this.showBookingModal = false
+        this.showSuccessModal = true
+        this.showNotification('info', '已添加到任务中心', '您可以在任务中心查看并管理此预约')
+        logger.info('Booking successful', { orderNo, tableId: this.selectedTable.id })
+      } catch (error) {
+        this.bookingError = '网络异常，请稍后重试'
+        logger.error('Booking request failed', error)
+      } finally {
+        this.bookingLoading = false
       }
-      this.successMessage = `${this.bookingDate} ${slot.time}`
-      
-      // 添加到任务中心
-      const bookingInfo = {
-        orderNo,
-        date: this.bookingDate,
-        time: slot.time,
-        duration: this.duration
+    },
+    /**
+     * 从任务中心「再次预约」带回 tableId 时，自动定位球桌并打开预约；
+     * 「继续付款」仅回到本页，不自动弹窗，避免与待付款记录错配。
+     */
+    handleRouteQuery() {
+      const { tableId, from } = this.$route.query
+      if (!tableId || from !== 'rebook') return
+      const id = Number(tableId)
+      const table = BASE_TABLES.find(t => t.id === id)
+      if (!table) return
+
+      if (!isAuthenticated()) {
+        this.pendingTable = table
+        this.showLoginModal = true
+        return
       }
-      taskStore.addBookingTask(this.selectedTable, bookingInfo)
-      
-      this.bookingLoading = false
-      this.showBookingModal = false
-      this.showSuccessModal = true
-      
-      this.showNotification('info', '已添加到任务中心', `您可以在任务中心查看并管理此预约`)
+      // 等待首个日期加载完成后再打开，保证占用状态是最新的
+      const tryOpen = () => {
+        const decorated = this.tablesForDate.find(t => t.id === id)
+        if (decorated?.available) {
+          this.openBooking(decorated)
+        } else if (decorated) {
+          this.showNotification('info', '该球桌当日暂不可约', '请切换日期或选择其他球桌')
+        }
+      }
+      if (this.isLoadingTables) {
+        this.routePollTimer = setInterval(() => {
+          if (!this.isLoadingTables) {
+            clearInterval(this.routePollTimer)
+            this.routePollTimer = null
+            tryOpen()
+          }
+        }, 100)
+      } else {
+        tryOpen()
+      }
     },
     showNotification(type, title, message) {
       this.toastType = type
@@ -846,6 +1109,29 @@ export default {
   background: rgba(0, 217, 165, 0.1);
   border-color: var(--primary);
   color: var(--primary);
+}
+
+.duration-btn.disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.booking-error {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: rgba(255, 107, 107, 0.1);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  border-radius: 10px;
+  color: #ff6b6b;
+  font-size: 0.85rem;
+}
+
+.booking-error svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
 }
 
 .booking-summary {

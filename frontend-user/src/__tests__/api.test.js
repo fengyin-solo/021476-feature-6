@@ -8,8 +8,9 @@
  * - 错误处理
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { api, logger } from '../utils/api'
+import { taskStore as ts } from '../utils/taskStore'
 
 // ==================== API接口测试 ====================
 
@@ -93,19 +94,74 @@ describe('API Module', () => {
 
   describe('api.bookTable', () => {
     it('should create booking successfully', async () => {
-      const bookingData = {
-        tableId: 1,
-        date: '2026-03-01',
-        timeSlot: '14:00-16:00',
-        duration: 2
+      const { validateBookingRequest, addDaysStr, todayStr, getSlotLabel } = await import(
+        '../utils/booking'
+      )
+
+      // 使用未来日期并挑选一个当前空闲的 2 小时时段，避免占用判定导致失败
+      let bookingData = null
+      for (let i = 1; i <= 7 && !bookingData; i++) {
+        const date = addDaysStr(todayStr(), i)
+        for (let id = 1; id <= 6; id++) {
+          if (validateBookingRequest({ tableId: 1, date, slotId: id, duration: 2 }, []).valid) {
+            bookingData = {
+              tableId: 1,
+              date,
+              timeSlot: getSlotLabel(id).replace(/\s/g, ''),
+              slotId: id,
+              duration: 2
+            }
+            break
+          }
+        }
       }
-      
+      expect(bookingData).not.toBeNull()
+
       const result = await api.bookTable(bookingData)
-      
+
       expect(result.success).toBe(true)
       expect(result.data.orderNo).toBeDefined()
       expect(result.data.orderNo).toMatch(/^BK\d+$/)
       expect(result.data.status).toBe('upcoming')
+    })
+
+    it('should reject a conflicting duplicate booking', async () => {
+      const { validateBookingRequest, addDaysStr, todayStr, getRangeForSlot } = await import(
+        '../utils/booking'
+      )
+
+      // 动态寻找一个未被模拟占用的（日期 + 时段）组合
+      let payload = null
+      for (let i = 2; i <= 8 && !payload; i++) {
+        const date = addDaysStr(todayStr(), i)
+        for (let slotId = 1; slotId <= 6; slotId++) {
+          const candidate = { tableId: 1, date, slotId, duration: 1 }
+          if (validateBookingRequest(candidate, []).valid) {
+            payload = candidate
+            break
+          }
+        }
+      }
+      expect(payload).not.toBeNull()
+
+      const first = await api.bookTable(payload)
+      expect(first.success).toBe(true)
+
+      const range = getRangeForSlot(payload.slotId, 1)
+      // 服务端只做校验不落库，因此冲突场景在 taskStore 写入后再验证
+      ts.addBookingTask(
+        { id: 1, name: '1号球桌', type: '斯诺克', price: 80 },
+        {
+          orderNo: first.data.orderNo,
+          date: payload.date,
+          time: `${range.start} - ${range.end}`,
+          duration: 1
+        }
+      )
+
+      const duplicate = await api.bookTable(payload)
+      expect(duplicate.success).toBe(false)
+      expect(duplicate.error).toMatch(/占用/)
     })
   })
 

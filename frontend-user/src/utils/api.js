@@ -24,6 +24,7 @@ const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
 
 // 任务存储（用于任务中心数据持久化）
 import { taskStore as ts } from './taskStore'
+import { validateBookingRequest, findSlotByStart } from './booking'
 const taskStore = ts
 
 /**
@@ -229,13 +230,37 @@ function handleLogout() {
 /**
  * 处理预约相关请求
  * GET: 返回预约列表
- * POST: 创建新预约
+ * POST: 创建新预约（服务端再次做占用判定，拒绝冲突与失效请求）
  */
 function handleBookings(options) {
   if (options.method === 'POST') {
     const body = JSON.parse(options.body || '{}')
+
+    // 兼容 timeSlot（'14:00-16:00'）与 slotId 两种入参
+    let slotId = body.slotId
+    if (slotId == null && body.timeSlot) {
+      const slot = findSlotByStart(body.timeSlot)
+      slotId = slot ? slot.id : null
+    }
+
+    const activeRanges = taskStore.getActiveBookingRanges()
+    const validation = validateBookingRequest(
+      {
+        tableId: body.tableId,
+        date: body.date,
+        slotId,
+        duration: body.duration
+      },
+      activeRanges
+    )
+
+    if (!validation.valid) {
+      logger.warn('Mock booking rejected', { reason: validation.error })
+      throw new Error(validation.error)
+    }
+
     const orderNo = 'BK' + Date.now().toString().slice(-8)
-    logger.info('Mock booking created', { orderNo })
+    logger.info('Mock booking created', { orderNo, tableId: body.tableId, date: body.date })
     return {
       orderNo,
       ...body,

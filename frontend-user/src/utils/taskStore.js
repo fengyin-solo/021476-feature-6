@@ -3,11 +3,26 @@
  * 统一管理预约、报名、订单等任务数据，使用 localStorage 持久化
  */
 
+import {
+  bookingRangeFromTask,
+  isActiveBookingTask,
+  BOOKING_CHANGED_EVENT
+} from './booking'
+
 const STORAGE_KEY = 'billiard_user_tasks'
 const logger = {
   info: (...args) => console.log('[taskStore]', ...args),
   warn: (...args) => console.warn('[taskStore]', ...args),
   error: (...args) => console.error('[taskStore]', ...args)
+}
+
+/**
+ * 预约记录变化后通知占用判定方重新计算（成功预约 / 取消后，球桌可用状态立即同步）
+ */
+function notifyBookingsChanged() {
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new Event(BOOKING_CHANGED_EVENT))
+  }
 }
 
 const taskTypeConfig = {
@@ -29,7 +44,8 @@ const taskTypeConfig = {
       completed: [
         { key: 'view', label: '查看结果', type: 'default' },
         { key: 'rebook', label: '再次预约', type: 'primary', route: '/tables' }
-      ]
+      ],
+      cancelled: []
     }
   },
   course: {
@@ -210,7 +226,8 @@ export const taskStore = {
       return tasks.filter(t => t.status !== 'completed' && t.status !== 'cancelled')
     }
     if (status === 'completed') {
-      return tasks.filter(t => t.status === 'completed')
+      // 已取消记录保留归档，与已完成一起返回
+      return tasks.filter(t => t.status === 'completed' || t.status === 'cancelled')
     }
     return tasks
   },
@@ -229,7 +246,11 @@ export const taskStore = {
       ...taskData
     }
     tasks.unshift(newTask)
-    saveTasks(tasks)
+    // 保存失败时返回 null，调用方不得把未持久化的任务当作成功，避免状态与记录错配
+    if (!saveTasks(tasks)) {
+      logger.error('任务保存失败', newTask)
+      return null
+    }
     logger.info('任务已添加', newTask)
     return enrichTask(newTask)
   },
@@ -242,7 +263,10 @@ export const taskStore = {
       return null
     }
     tasks[index] = { ...tasks[index], ...updates }
-    saveTasks(tasks)
+    if (!saveTasks(tasks)) {
+      logger.error('任务更新保存失败', taskId)
+      return null
+    }
     logger.info('任务已更新', taskId, updates)
     return enrichTask(tasks[index])
   },
@@ -269,7 +293,7 @@ export const taskStore = {
   },
 
   addBookingTask(table, bookingInfo) {
-    return this.add({
+    const task = this.add({
       type: 'booking',
       title: `${table.name} - ${table.type}`,
       subtitle: `${bookingInfo.date} ${bookingInfo.time}`,
@@ -283,6 +307,42 @@ export const taskStore = {
         orderNo: bookingInfo.orderNo
       }
     })
+    if (task) notifyBookingsChanged()
+    return task
+  },
+
+  /**
+   * 获取所有仍占用球桌的预约任务（待付款 / 待开始 / 进行中）
+   */
+  getActiveBookings() {
+    return loadTasks().filter(isActiveBookingTask)
+  },
+
+  /**
+   * 获取归一化后的有效预约时间区间，供占用判定 / 冲突检测使用
+   */
+  getActiveBookingRanges() {
+    return this.getActiveBookings()
+      .map(bookingRangeFromTask)
+      .filter(Boolean)
+  },
+
+  /**
+   * 取消预约任务：保留记录并标记为已取消，同时释放球桌占用
+   * 与直接 remove 不同，取消后任务记录仍可在已完成列表中查看，保证记录一致
+   */
+  cancelBookingTask(taskId) {
+    const task = this.getById(taskId)
+    if (!task || task.type !== 'booking') {
+      logger.warn('预约任务不存在，无法取消', taskId)
+      return null
+    }
+    const updated = this.update(taskId, {
+      status: 'cancelled',
+      subtitle: '已取消：' + task.subtitle
+    })
+    if (updated) notifyBookingsChanged()
+    return updated
   },
 
   addCourseTask(course, enrollInfo) {

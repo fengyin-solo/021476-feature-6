@@ -167,7 +167,7 @@
       icon="warning"
       icon-type="warning"
       title="确认取消"
-      subtitle="确定要取消此任务吗？"
+      :subtitle="cancelSubtitle"
       size="small"
       confirm-text="确认取消"
       confirm-type="danger"
@@ -272,6 +272,12 @@ export default {
       if (!this.selectedTask || this.selectedTask.amount == null) return ''
       return '确认支付 ¥' + this.selectedTask.amount.toLocaleString() + ' 元'
     },
+    cancelSubtitle() {
+      if (this.selectedTask?.type === 'booking') {
+        return '取消后预约记录将保留在已完成列表中，球桌时段将重新开放'
+      }
+      return '确定要取消此任务吗？'
+    },
     allTasks() {
       this.refreshKey
       return taskStore.getAll()
@@ -280,7 +286,8 @@ export default {
       return this.allTasks.filter(task => task.status !== 'completed' && task.status !== 'cancelled')
     },
     completedTasks() {
-      return this.allTasks.filter(task => task.status === 'completed')
+      // 已取消的预约记录保留，与已完成一起归档展示
+      return this.allTasks.filter(task => task.status === 'completed' || task.status === 'cancelled')
     },
     pendingCount() {
       return this.pendingTasks.length
@@ -362,6 +369,8 @@ export default {
           query.orderNo = task.extra.orderNo
         }
       }
+      // 带上来源动作，业务页可据此决定是否自动续接（如再次预约直接打开弹窗）
+      if (actionKey) query.from = actionKey
       
       this.$router.push({ path: route, query })
     },
@@ -398,18 +407,30 @@ export default {
     async confirmCancel() {
       if (!this.selectedTask) return
       this.cancelLoading = true
-      
+
       await new Promise(resolve => setTimeout(resolve, 800))
-      
-      const result = taskStore.remove(this.selectedTask.id)
-      
+
+      // 预约取消：保留记录并标记为已取消，同时释放球桌占用；
+      // 其他类型任务沿用删除逻辑
+      const result =
+        this.selectedTask.type === 'booking'
+          ? taskStore.cancelBookingTask(this.selectedTask.id)
+          : taskStore.remove(this.selectedTask.id)
+
       this.cancelLoading = false
       this.showCancelModal = false
-      
+
       if (result) {
         this.refreshTasks()
-        this.showNotification('success', '取消成功', '任务已取消')
-        logger.info('Task cancelled', { taskId: this.selectedTask.id })
+        this.showNotification(
+          'success',
+          '取消成功',
+          this.selectedTask.type === 'booking' ? '预约已取消，球桌时段已释放' : '任务已取消'
+        )
+        logger.info('Task cancelled', {
+          taskId: this.selectedTask.id,
+          type: this.selectedTask.type
+        })
       } else {
         this.showNotification('error', '取消失败', '请稍后重试')
       }
